@@ -20,7 +20,7 @@ HEADERS = {
 }
 
 # ✅ SAFE SIZE FOR $33 ACCOUNT
-BASE_UNITS = 5
+BASE_UNITS = 100
 
 # Instrument formatting
 SYMBOL_MAP = {
