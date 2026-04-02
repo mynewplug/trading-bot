@@ -33,11 +33,28 @@ SYMBOL_MAP = {
     "GBPJPY": "GBP_JPY"
 }
 
+# Typical display precision by instrument
+INSTRUMENT_PRECISION = {
+    "EUR_USD": 5,
+    "GBP_USD": 5,
+    "AUD_USD": 5,
+    "NZD_USD": 5,
+    "USD_CAD": 5,
+    "USD_CHF": 5,
+    "EUR_JPY": 3,
+    "GBP_JPY": 3,
+    "USD_JPY": 3,
+    "XAU_USD": 2,
+    "XAG_USD": 3,
+}
 
 def get_oanda_instrument(tv_symbol: str) -> str:
     clean = str(tv_symbol).replace("OANDA:", "").replace("/", "").upper().strip()
     return SYMBOL_MAP.get(clean, clean)
 
+def format_price(instrument: str, price) -> str:
+    decimals = INSTRUMENT_PRECISION.get(instrument, 5)
+    return f"{float(price):.{decimals}f}"
 
 def place_order(symbol, action, sl, tp):
     instrument = get_oanda_instrument(symbol)
@@ -49,6 +66,9 @@ def place_order(symbol, action, sl, tp):
     else:
         return 400, f"Invalid action: {action}"
 
+    sl_price = format_price(instrument, sl)
+    tp_price = format_price(instrument, tp)
+
     url = f"{BASE_URL}/v3/accounts/{OANDA_ACCOUNT_ID}/orders"
 
     payload = {
@@ -59,10 +79,10 @@ def place_order(symbol, action, sl, tp):
             "timeInForce": "FOK",
             "positionFill": "DEFAULT",
             "stopLossOnFill": {
-                "price": str(sl)
+                "price": sl_price
             },
             "takeProfitOnFill": {
-                "price": str(tp)
+                "price": tp_price
             }
         }
     }
@@ -79,11 +99,9 @@ def place_order(symbol, action, sl, tp):
         print("OANDA request exception:", str(e))
         return 500, str(e)
 
-
 @app.route("/", methods=["GET"])
 def home():
     return "Bot is running 🚀", 200
-
 
 @app.route("/webhook", methods=["POST"])
 def webhook():
@@ -106,7 +124,6 @@ def webhook():
         except Exception:
             score = 0
 
-        # Test-friendly filter
         if score < 1:
             print("Skipped trade: low score", score)
             return jsonify({
@@ -127,6 +144,8 @@ def webhook():
         status, response_text = place_order(symbol, action, sl, tp)
 
         return jsonify({
+Use Control + Shift + m to toggle the tab key moving focus. Alternatively, use esc then tab to move to the next interactive element on the page.
+
             "ok": status in [200, 201],
             "status": "executed" if status in [200, 201] else "failed",
             "oanda_status": status,
@@ -139,7 +158,6 @@ def webhook():
             "ok": False,
             "error": str(e)
         }), 500
-
 
 if __name__ == "__main__":
     port = int(os.getenv("PORT", 8000))
