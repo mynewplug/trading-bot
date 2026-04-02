@@ -67,8 +67,8 @@ def place_order(symbol, action, sl, tp, current_price):
     tp_val = float(tp)
     price = float(current_price)
 
-    # ✅ MIN DISTANCE (5 pips for EURUSD)
-    MIN_DISTANCE = 0.0005
+    # ✅ MIN DISTANCE (10 pips for EURUSD)
+    MIN_DISTANCE = 0.0010
 
     # 🔥 FIX SL/TP LOGIC
     if action == "buy":
