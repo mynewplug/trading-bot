@@ -108,12 +108,8 @@ def place_order(symbol: str, action: str, sl: float, tp: float):
             "type": "MARKET",
             "timeInForce": "FOK",
             "positionFill": "DEFAULT",
-            "stopLossOnFill": {
-                "price": sl_price
-            },
-            "takeProfitOnFill": {
-                "price": tp_price
-            }
+            "stopLossOnFill": {"price": sl_price},
+            "takeProfitOnFill": {"price": tp_price}
         }
     }
 
