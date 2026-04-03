@@ -47,7 +47,7 @@ INSTRUMENT_PRECISION = {
 
 # tighter scalp settings by instrument
 SCALP_SL_DISTANCE = {
-    "EUR_USD": 0.00050,  # 5 pips
+    "EUR_USD": 0.00030,  # 3 pips
     "GBP_USD": 0.00060,
     "AUD_USD": 0.00050,
     "NZD_USD": 0.00050,
@@ -59,7 +59,7 @@ SCALP_SL_DISTANCE = {
 }
 
 SCALP_TP_DISTANCE = {
-    "EUR_USD": 0.00080,  # 8 pips
+    "EUR_USD": 0.00050,  # 5 pips
     "GBP_USD": 0.00100,
     "AUD_USD": 0.00080,
     "NZD_USD": 0.00080,
