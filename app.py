@@ -26,10 +26,6 @@ HEADERS = {
 # SETTINGS
 # ====================
 BASE_UNITS = int(os.getenv("BASE_UNITS", "1000"))
-
-# Small broker safety buffer.
-# This is NOT meant to override Strat logic,
-# only to prevent invalid SL/TP ordering or zero-distance issues.
 MIN_PRICE_BUFFER = float(os.getenv("MIN_PRICE_BUFFER", "0.00005"))
 
 # ====================
@@ -70,9 +66,6 @@ def format_price(instrument: str, price: float) -> str:
     return f"{float(price):.{decimals}f}"
 
 
-# ====================
-# OPEN TRADE CHECK
-# ====================
 def has_open_trade() -> bool:
     url = f"{BASE_URL}/v3/accounts/{OANDA_ACCOUNT_ID}/openTrades"
     r = requests.get(url, headers=HEADERS, timeout=15)
@@ -86,15 +79,7 @@ def has_open_trade() -> bool:
     return len(trades) > 0
 
 
-# ====================
-# VALIDATE / CLEAN SL-TP
-# ====================
 def validate_levels(action: str, price: float, sl: float, tp: float):
-    """
-    Keep Pine's Strat-style logic intact, but ensure levels are valid:
-    BUY: sl < price < tp
-    SELL: tp < price < sl
-    """
     buffer_amt = MIN_PRICE_BUFFER
 
     if action == "buy":
@@ -102,7 +87,6 @@ def validate_levels(action: str, price: float, sl: float, tp: float):
             sl = price - buffer_amt
         if tp <= price:
             tp = price + buffer_amt
-
         if (price - sl) < buffer_amt:
             sl = price - buffer_amt
         if (tp - price) < buffer_amt:
@@ -113,7 +97,6 @@ def validate_levels(action: str, price: float, sl: float, tp: float):
             sl = price + buffer_amt
         if tp >= price:
             tp = price - buffer_amt
-
         if (sl - price) < buffer_amt:
             sl = price + buffer_amt
         if (price - tp) < buffer_amt:
@@ -122,9 +105,6 @@ def validate_levels(action: str, price: float, sl: float, tp: float):
     return sl, tp
 
 
-# ====================
-# ORDER PLACEMENT
-# ====================
 def place_order(symbol: str, action: str, price: float, sl: float, tp: float):
     instrument = get_oanda_instrument(symbol)
 
@@ -151,12 +131,8 @@ def place_order(symbol: str, action: str, price: float, sl: float, tp: float):
             "type": "MARKET",
             "timeInForce": "FOK",
             "positionFill": "DEFAULT",
-            "stopLossOnFill": {
-                "price": sl_price
-            },
-            "takeProfitOnFill": {
-                "price": tp_price
-            }
+            "stopLossOnFill": {"price": sl_price},
+            "takeProfitOnFill": {"price": tp_price}
         }
     }
 
@@ -171,9 +147,6 @@ def place_order(symbol: str, action: str, price: float, sl: float, tp: float):
     return r.status_code, r.text
 
 
-# ====================
-# ROUTES
-# ====================
 @app.route("/", methods=["GET"])
 def home():
     return "Bot is running 🚀", 200
@@ -185,18 +158,30 @@ def webhook():
 
     if not data:
         print("No JSON received")
-        return jsonify({
-            "status": "error",
-            "message": "No JSON received"
-        }), 400
+        return jsonify({"status": "error", "message": "No JSON received"}), 400
 
     print("Webhook received:", data)
 
     action = str(data.get("action", "")).lower().strip()
     symbol = str(data.get("symbol", "")).upper().strip()
+    timeframe = str(data.get("timeframe", "")).strip()
     price = data.get("price")
     time_value = data.get("time")
     signal = str(data.get("signal", "")).strip()
+
+    # heartbeat / scan mode
+    if action == "scan":
+        print(
+            f"SCAN OK -> symbol={symbol}, timeframe={timeframe}, price={price}, "
+            f"signal={signal}, insideBar={data.get('insideBar')}, twoUp={data.get('twoUp')}, "
+            f"twoDown={data.get('twoDown')}, outsideBar={data.get('outsideBar')}, "
+            f"sessionOK={data.get('sessionOK')}, positionSize={data.get('positionSize')}, time={time_value}"
+        )
+        return jsonify({
+            "status": "scan_logged",
+            "signal": signal
+        }), 200
+
     sl = data.get("sl")
     tp = data.get("tp")
 
@@ -223,7 +208,7 @@ def webhook():
         }), 400
 
     print(
-        f"Parsed signal -> action={action}, symbol={symbol}, "
+        f"Parsed signal -> action={action}, symbol={symbol}, timeframe={timeframe}, "
         f"price={price}, signal={signal}, sl={sl}, tp={tp}, time={time_value}"
     )
 
