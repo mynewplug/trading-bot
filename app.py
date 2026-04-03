@@ -26,7 +26,6 @@ HEADERS = {
 # SETTINGS
 # ====================
 BASE_UNITS = int(os.getenv("BASE_UNITS", "1000"))
-MIN_SCORE = float(os.getenv("MIN_SCORE", "0"))
 
 # ====================
 # SYMBOL / PRECISION
@@ -151,7 +150,6 @@ def webhook():
     symbol = str(data.get("symbol", "")).upper().strip()
     price = data.get("price")
     time_value = data.get("time")
-    score = float(data.get("score", 0))
     signal = str(data.get("signal", "")).strip()
     sl = data.get("sl")
     tp = data.get("tp")
@@ -178,17 +176,9 @@ def webhook():
             "message": "Invalid numeric value in price/sl/tp"
         }), 400
 
-    if score < MIN_SCORE:
-        print(f"Skipped: score {score} < MIN_SCORE {MIN_SCORE}")
-        return jsonify({
-            "status": "skipped",
-            "message": "Low score"
-        }), 200
-
     print(
         f"Parsed signal -> action={action}, symbol={symbol}, "
-        f"price={price}, score={score}, signal={signal}, "
-        f"sl={sl}, tp={tp}, time={time_value}"
+        f"price={price}, signal={signal}, sl={sl}, tp={tp}, time={time_value}"
     )
 
     status, response = place_order(symbol, action, sl, tp)
