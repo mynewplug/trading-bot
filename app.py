@@ -19,7 +19,11 @@ HEADERS = {
     "Content-Type": "application/json"
 }
 
+#====================================================
+# SETTINGS
+#====================================================
 BASE_UNITS = 1000
+MIN_SCORE = 48  # matches your Pine strategy directionally
 
 SYMBOL_MAP = {
     "EURUSD": "EUR_USD",
@@ -45,56 +49,59 @@ INSTRUMENT_PRECISION = {
     "XAG_USD": 3,
 }
 
-# tighter scalp settings by instrument
+# tighter scalp distances
 SCALP_SL_DISTANCE = {
     "EUR_USD": 0.00030,  # 3 pips
+    "GBP_USD": 0.00040,
+    "AUD_USD": 0.00030,
+    "NZD_USD": 0.00030,
+    "USD_CAD": 0.00030,
+    "USD_CHF": 0.00030,
+    "USD_JPY": 0.030,
+    "XAU_USD": 0.80,
+    "XAG_USD": 0.06,
+}
+
+SCALP_TP_DISTANCE = {
+    "EUR_USD": 0.00050,  # 5 pips
     "GBP_USD": 0.00060,
     "AUD_USD": 0.00050,
     "NZD_USD": 0.00050,
     "USD_CAD": 0.00050,
     "USD_CHF": 0.00050,
-    "USD_JPY": 0.050,    # 5 pips on JPY pairs
-    "XAU_USD": 1.00,
-    "XAG_USD": 0.08,
+    "USD_JPY": 0.050,
+    "XAU_USD": 1.20,
+    "XAG_USD": 0.10,
 }
 
-SCALP_TP_DISTANCE = {
-    "EUR_USD": 0.00050,  # 5 pips
-    "GBP_USD": 0.00100,
-    "AUD_USD": 0.00080,
-    "NZD_USD": 0.00080,
-    "USD_CAD": 0.00080,
-    "USD_CHF": 0.00080,
-    "USD_JPY": 0.080,    # 8 pips on JPY pairs
-    "XAU_USD": 1.60,
-    "XAG_USD": 0.12,
-}
-
-def get_oanda_instrument(tv_symbol):
+#====================================================
+# HELPERS
+#====================================================
+def get_oanda_instrument(tv_symbol: str) -> str:
     clean = str(tv_symbol).replace("OANDA:", "").replace("/", "").upper().strip()
     return SYMBOL_MAP.get(clean, clean)
 
-def format_price(instrument, price):
+def format_price(instrument: str, price: float) -> str:
     decimals = INSTRUMENT_PRECISION.get(instrument, 5)
     return f"{float(price):.{decimals}f}"
 
-def has_open_trade():
+def has_open_trade() -> bool:
     url = f"{BASE_URL}/v3/accounts/{OANDA_ACCOUNT_ID}/openTrades"
     r = requests.get(url, headers=HEADERS, timeout=15)
 
     if r.status_code != 200:
-        print("Error checking trades:", r.text)
+        print("Error checking open trades:", r.status_code, r.text)
         return False
 
     trades = r.json().get("trades", [])
     print("Open trades count:", len(trades))
     return len(trades) > 0
 
-def build_scalp_prices(instrument, action, current_price):
+def build_scalp_prices(instrument: str, action: str, current_price: float):
     price = float(current_price)
 
-    sl_dist = SCALP_SL_DISTANCE.get(instrument, 0.00050)
-    tp_dist = SCALP_TP_DISTANCE.get(instrument, 0.00080)
+    sl_dist = SCALP_SL_DISTANCE.get(instrument, 0.00030)
+    tp_dist = SCALP_TP_DISTANCE.get(instrument, 0.00050)
 
     if action == "buy":
         sl_price = price - sl_dist
@@ -107,7 +114,7 @@ def build_scalp_prices(instrument, action, current_price):
 
     return format_price(instrument, sl_price), format_price(instrument, tp_price)
 
-def place_order(symbol, action, sl, tp, current_price):
+def place_order(symbol: str, action: str, current_price: float):
     instrument = get_oanda_instrument(symbol)
 
     if has_open_trade():
@@ -116,7 +123,6 @@ def place_order(symbol, action, sl, tp, current_price):
 
     units = BASE_UNITS if action == "buy" else -BASE_UNITS
 
-    # build tighter scalp SL/TP from current price
     sl_price, tp_price = build_scalp_prices(instrument, action, current_price)
 
     url = f"{BASE_URL}/v3/accounts/{OANDA_ACCOUNT_ID}/orders"
@@ -128,12 +134,16 @@ def place_order(symbol, action, sl, tp, current_price):
             "type": "MARKET",
             "timeInForce": "FOK",
             "positionFill": "DEFAULT",
-            "stopLossOnFill": {"price": sl_price},
-            "takeProfitOnFill": {"price": tp_price}
+            "stopLossOnFill": {
+                "price": sl_price
+            },
+            "takeProfitOnFill": {
+                "price": tp_price
+            }
         }
     }
 
-    print("Sending order:", payload)
+    print("Sending order payload:", payload)
 
     r = requests.post(url, headers=HEADERS, json=payload, timeout=20)
 
@@ -142,38 +152,50 @@ def place_order(symbol, action, sl, tp, current_price):
 
     return r.status_code, r.text
 
+#====================================================
+# ROUTES
+#====================================================
 @app.route("/", methods=["GET"])
 def home():
     return "Bot is running 🚀", 200
 
 @app.route("/webhook", methods=["POST"])
 def webhook():
-    data = request.get_json()
+    data = request.get_json(force=True, silent=True)
 
-    print("Webhook:", data)
+    if not data:
+        print("No JSON received")
+        return jsonify({"status": "error", "message": "No JSON received"}), 400
+
+    print("Webhook received:", data)
 
     action = str(data.get("action", "")).lower().strip()
     symbol = str(data.get("symbol", "")).upper().strip()
-    sl = data.get("sl")
-    tp = data.get("tp")
     price = data.get("price")
     score = float(data.get("score", 0))
 
-    if score < 1:
-        print("Skipped low score")
-        return jsonify({"status": "skipped"}), 200
-
-    if not action or not symbol or not price:
+    if not action or not symbol or price is None:
         print("Missing required fields")
-        return jsonify({"status": "error", "response": "Missing action, symbol, or price"}), 400
+        return jsonify({"status": "error", "message": "Missing action, symbol, or price"}), 400
 
-    status, response = place_order(symbol, action, sl, tp, price)
+    if action not in ["buy", "sell"]:
+        print("Invalid action:", action)
+        return jsonify({"status": "error", "message": f"Invalid action: {action}"}), 400
+
+    if score < MIN_SCORE:
+        print(f"Skipped low score: {score} < {MIN_SCORE}")
+        return jsonify({"status": "skipped", "message": "Low score"}), 200
+
+    status, response = place_order(symbol, action, float(price))
 
     return jsonify({
         "status": status,
         "response": response
     }), 200
 
+#====================================================
+# MAIN
+#====================================================
 if __name__ == "__main__":
     port = int(os.getenv("PORT", 8000))
     app.run(host="0.0.0.0", port=port)
