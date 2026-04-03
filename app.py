@@ -27,6 +27,11 @@ HEADERS = {
 # ====================
 BASE_UNITS = int(os.getenv("BASE_UNITS", "1000"))
 
+# Small broker safety buffer.
+# This is NOT meant to override Strat logic,
+# only to prevent invalid SL/TP ordering or zero-distance issues.
+MIN_PRICE_BUFFER = float(os.getenv("MIN_PRICE_BUFFER", "0.00005"))
+
 # ====================
 # SYMBOL / PRECISION
 # ====================
@@ -82,9 +87,45 @@ def has_open_trade() -> bool:
 
 
 # ====================
+# VALIDATE / CLEAN SL-TP
+# ====================
+def validate_levels(action: str, price: float, sl: float, tp: float):
+    """
+    Keep Pine's Strat-style logic intact, but ensure levels are valid:
+    BUY: sl < price < tp
+    SELL: tp < price < sl
+    """
+    buffer_amt = MIN_PRICE_BUFFER
+
+    if action == "buy":
+        if sl >= price:
+            sl = price - buffer_amt
+        if tp <= price:
+            tp = price + buffer_amt
+
+        if (price - sl) < buffer_amt:
+            sl = price - buffer_amt
+        if (tp - price) < buffer_amt:
+            tp = price + buffer_amt
+
+    elif action == "sell":
+        if sl <= price:
+            sl = price + buffer_amt
+        if tp >= price:
+            tp = price - buffer_amt
+
+        if (sl - price) < buffer_amt:
+            sl = price + buffer_amt
+        if (price - tp) < buffer_amt:
+            tp = price - buffer_amt
+
+    return sl, tp
+
+
+# ====================
 # ORDER PLACEMENT
 # ====================
-def place_order(symbol: str, action: str, sl: float, tp: float):
+def place_order(symbol: str, action: str, price: float, sl: float, tp: float):
     instrument = get_oanda_instrument(symbol)
 
     if has_open_trade():
@@ -98,6 +139,8 @@ def place_order(symbol: str, action: str, sl: float, tp: float):
     else:
         return 400, f"Invalid action: {action}"
 
+    sl, tp = validate_levels(action, price, sl, tp)
+
     sl_price = format_price(instrument, sl)
     tp_price = format_price(instrument, tp)
 
@@ -108,8 +151,12 @@ def place_order(symbol: str, action: str, sl: float, tp: float):
             "type": "MARKET",
             "timeInForce": "FOK",
             "positionFill": "DEFAULT",
-            "stopLossOnFill": {"price": sl_price},
-            "takeProfitOnFill": {"price": tp_price}
+            "stopLossOnFill": {
+                "price": sl_price
+            },
+            "takeProfitOnFill": {
+                "price": tp_price
+            }
         }
     }
 
@@ -138,7 +185,10 @@ def webhook():
 
     if not data:
         print("No JSON received")
-        return jsonify({"status": "error", "message": "No JSON received"}), 400
+        return jsonify({
+            "status": "error",
+            "message": "No JSON received"
+        }), 400
 
     print("Webhook received:", data)
 
@@ -177,7 +227,7 @@ def webhook():
         f"price={price}, signal={signal}, sl={sl}, tp={tp}, time={time_value}"
     )
 
-    status, response = place_order(symbol, action, sl, tp)
+    status, response = place_order(symbol, action, price, sl, tp)
 
     return jsonify({
         "status": status,
