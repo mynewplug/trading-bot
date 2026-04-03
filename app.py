@@ -81,7 +81,7 @@ def place_order(symbol, action, sl, tp, current_price):
     tp_val = float(tp)
     price = float(current_price)
 
-    MIN_DISTANCE = 0.0010  # 10 pips safety
+    MIN_DISTANCE = 0.005  # 10 pips safety
 
     if action == "buy":
         if sl_val >= price:
