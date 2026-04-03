@@ -27,8 +27,9 @@ HEADERS = {
 # ====================
 BASE_UNITS = int(os.getenv("BASE_UNITS", "1000"))
 
-# In your Pine script, "score" is RSI
-# So this bot treats score as RSI.
+# Pine sends RSI as "score"
+# Buy RSI min in Pine is 40, sell RSI max is 60
+# Keep Python permissive so Pine stays the main brain
 MIN_SCORE = float(os.getenv("MIN_SCORE", "0"))
 
 # ====================
@@ -91,6 +92,7 @@ def has_open_trade() -> bool:
 def place_order(symbol: str, action: str, sl: float, tp: float):
     instrument = get_oanda_instrument(symbol)
 
+    # one trade at a time
     if has_open_trade():
         print("Skipped: open trade already exists")
         return 200, "Skipped: open trade exists"
@@ -153,9 +155,10 @@ def webhook():
     action = str(data.get("action", "")).lower().strip()
     symbol = str(data.get("symbol", "")).upper().strip()
     price = data.get("price")
+    time_value = data.get("time")
+    score = float(data.get("score", 0))
     sl = data.get("sl")
     tp = data.get("tp")
-    score = float(data.get("score", 0))
 
     if not action or not symbol or price is None or sl is None or tp is None:
         return jsonify({
@@ -169,21 +172,28 @@ def webhook():
             "message": f"Invalid action: {action}"
         }), 400
 
+    try:
+        sl = float(sl)
+        tp = float(tp)
+        price = float(price)
+    except ValueError:
+        return jsonify({
+            "status": "error",
+            "message": "Invalid numeric value in price/sl/tp"
+        }), 400
+
+    # score is RSI in this Pine script
     if score < MIN_SCORE:
-        print(f"Skipped low score: {score} < {MIN_SCORE}")
+        print(f"Skipped: score {score} < MIN_SCORE {MIN_SCORE}")
         return jsonify({
             "status": "skipped",
             "message": "Low score"
         }), 200
 
-    try:
-        sl = float(sl)
-        tp = float(tp)
-    except ValueError:
-        return jsonify({
-            "status": "error",
-            "message": "Invalid sl/tp format"
-        }), 400
+    print(
+        f"Parsed signal -> action={action}, symbol={symbol}, "
+        f"price={price}, score={score}, sl={sl}, tp={tp}, time={time_value}"
+    )
 
     status, response = place_order(symbol, action, sl, tp)
 
@@ -194,5 +204,5 @@ def webhook():
 
 
 if __name__ == "__main__":
-    port = int(os.getenv("PORT", 8000))
+    port = int(os.getenv("PORT", "8000"))
     app.run(host="0.0.0.0", port=port)
