@@ -23,7 +23,7 @@ HEADERS = {
 # SETTINGS
 #====================================================
 BASE_UNITS = 1000
-MIN_SCORE = 48  # matches your Pine strategy directionally
+MIN_SCORE = 0  # matches your Pine strategy directionally
 
 SYMBOL_MAP = {
     "EURUSD": "EUR_USD",
