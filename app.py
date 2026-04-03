@@ -19,7 +19,7 @@ HEADERS = {
     "Content-Type": "application/json"
 }
 
-BASE_UNITS = 100  # adjust if needed
+BASE_UNITS = 1000  # adjust if needed
 
 SYMBOL_MAP = {
     "EURUSD": "EUR_USD",
