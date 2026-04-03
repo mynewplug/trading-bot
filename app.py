@@ -19,10 +19,8 @@ HEADERS = {
     "Content-Type": "application/json"
 }
 
-# ✅ SAFE SIZE FOR $33 ACCOUNT
-BASE_UNITS = 100
+BASE_UNITS = 100  # adjust if needed
 
-# Instrument formatting
 SYMBOL_MAP = {
     "EURUSD": "EUR_USD",
     "GBPUSD": "GBP_USD",
@@ -35,7 +33,6 @@ SYMBOL_MAP = {
     "XAGUSD": "XAG_USD"
 }
 
-# Price precision
 INSTRUMENT_PRECISION = {
     "EUR_USD": 5,
     "GBP_USD": 5,
@@ -48,62 +45,66 @@ INSTRUMENT_PRECISION = {
     "XAG_USD": 3,
 }
 
-def get_oanda_instrument(tv_symbol: str) -> str:
-    clean = str(tv_symbol).replace("OANDA:", "").replace("/", "").upper().strip()
+def get_oanda_instrument(tv_symbol):
+    clean = str(tv_symbol).replace("OANDA:", "").replace("/", "").upper()
     return SYMBOL_MAP.get(clean, clean)
 
-def format_price(instrument: str, price) -> str:
+def format_price(instrument, price):
     decimals = INSTRUMENT_PRECISION.get(instrument, 5)
     return f"{float(price):.{decimals}f}"
+
+# 🔒 CHECK OPEN TRADES
+def has_open_trade():
+    url = f"{BASE_URL}/v3/accounts/{OANDA_ACCOUNT_ID}/openTrades"
+    r = requests.get(url, headers=HEADERS)
+
+    if r.status_code != 200:
+        print("Error checking trades:", r.text)
+        return False
+
+    trades = r.json().get("trades", [])
+    print("Open trades count:", len(trades))
+
+    return len(trades) > 0
 
 def place_order(symbol, action, sl, tp, current_price):
     instrument = get_oanda_instrument(symbol)
 
-    # ✅ Safe units
+    # 🔒 BLOCK IF TRADE EXISTS
+    if has_open_trade():
+        print("Trade skipped: already have open trade")
+        return 200, "Skipped: open trade exists"
+
     units = BASE_UNITS if action == "buy" else -BASE_UNITS
 
-    # ✅ Convert values
     sl_val = float(sl)
     tp_val = float(tp)
     price = float(current_price)
 
-    # ✅ MIN DISTANCE (10 pips for EURUSD)
-    MIN_DISTANCE = 0.0010
+    MIN_DISTANCE = 0.0010  # 10 pips safety
 
-    # 🔥 FIX SL/TP LOGIC
     if action == "buy":
-        # SL must be below price
         if sl_val >= price:
             sl_val = price - MIN_DISTANCE
-
-        # TP must be above price
         if tp_val <= price:
             tp_val = price + MIN_DISTANCE
 
-        # ensure distance
         if (price - sl_val) < MIN_DISTANCE:
             sl_val = price - MIN_DISTANCE
-
         if (tp_val - price) < MIN_DISTANCE:
             tp_val = price + MIN_DISTANCE
 
     elif action == "sell":
-        # SL must be above price
         if sl_val <= price:
             sl_val = price + MIN_DISTANCE
-
-        # TP must be below price
         if tp_val >= price:
             tp_val = price - MIN_DISTANCE
 
-        # ensure distance
         if (sl_val - price) < MIN_DISTANCE:
             sl_val = price + MIN_DISTANCE
-
         if (price - tp_val) < MIN_DISTANCE:
             tp_val = price - MIN_DISTANCE
 
-    # ✅ Format properly
     sl_price = format_price(instrument, sl_val)
     tp_price = format_price(instrument, tp_val)
 
@@ -116,26 +117,19 @@ def place_order(symbol, action, sl, tp, current_price):
             "type": "MARKET",
             "timeInForce": "FOK",
             "positionFill": "DEFAULT",
-            "stopLossOnFill": {
-                "price": sl_price
-            },
-            "takeProfitOnFill": {
-                "price": tp_price
-            }
+            "stopLossOnFill": {"price": sl_price},
+            "takeProfitOnFill": {"price": tp_price}
         }
     }
 
-    print("Sending order to OANDA:")
-    print(payload)
+    print("Sending order:", payload)
 
-    try:
-        response = requests.post(url, headers=HEADERS, json=payload, timeout=20)
-        print("OANDA status:", response.status_code)
-        print("OANDA response:", response.text)
-        return response.status_code, response.text
-    except Exception as e:
-        print("OANDA error:", str(e))
-        return 500, str(e)
+    r = requests.post(url, headers=HEADERS, json=payload)
+
+    print("OANDA status:", r.status_code)
+    print("OANDA response:", r.text)
+
+    return r.status_code, r.text
 
 
 @app.route("/", methods=["GET"])
@@ -145,45 +139,24 @@ def home():
 
 @app.route("/webhook", methods=["POST"])
 def webhook():
-    try:
-        data = request.get_json(force=True, silent=True)
+    data = request.get_json()
 
-        if not data:
-            print("No data received")
-            return jsonify({"error": "No data"}), 400
+    print("Webhook:", data)
 
-        print("Webhook data:", data)
+    action = str(data.get("action", "")).lower()
+    symbol = str(data.get("symbol", "")).upper()
+    sl = data.get("sl")
+    tp = data.get("tp")
+    price = data.get("price")
+    score = float(data.get("score", 0))
 
-        action = str(data.get("action", "")).lower()
-        symbol = str(data.get("symbol", "")).upper()
-        sl = data.get("sl")
-        tp = data.get("tp")
-        price = data.get("price")
+    if score < 1:
+        print("Skipped low score")
+        return jsonify({"status": "skipped"}), 200
 
-        score = float(data.get("score", 0))
+    status, response = place_order(symbol, action, sl, tp, price)
 
-        # ✅ allow trades for testing
-        if score < 1:
-            print("Skipped: low score")
-            return jsonify({"status": "skipped"}), 200
-
-        if not action or not symbol or not sl or not tp or not price:
-            print("Missing data")
-            return jsonify({"error": "missing fields"}), 400
-
-        status, response = place_order(symbol, action, sl, tp, price)
-
-        return jsonify({
-            "status": "executed" if status in [200, 201] else "failed",
-            "oanda_status": status,
-            "response": response
-        }), 200
-
-    except Exception as e:
-        print("Webhook error:", str(e))
-        return jsonify({"error": str(e)}), 500
-
-
-if __name__ == "__main__":
-    port = int(os.getenv("PORT", 8000))
-    app.run(host="0.0.0.0", port=port)
+    return jsonify({
+        "status": status,
+        "response": response
+    })
