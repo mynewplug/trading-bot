@@ -26,10 +26,6 @@ HEADERS = {
 # SETTINGS
 # ====================
 BASE_UNITS = int(os.getenv("BASE_UNITS", "1000"))
-
-# Pine sends RSI as "score"
-# Buy RSI min in Pine is 40, sell RSI max is 60
-# Keep Python permissive so Pine stays the main brain
 MIN_SCORE = float(os.getenv("MIN_SCORE", "0"))
 
 # ====================
@@ -92,7 +88,6 @@ def has_open_trade() -> bool:
 def place_order(symbol: str, action: str, sl: float, tp: float):
     instrument = get_oanda_instrument(symbol)
 
-    # one trade at a time
     if has_open_trade():
         print("Skipped: open trade already exists")
         return 200, "Skipped: open trade exists"
@@ -157,6 +152,7 @@ def webhook():
     price = data.get("price")
     time_value = data.get("time")
     score = float(data.get("score", 0))
+    signal = str(data.get("signal", "")).strip()
     sl = data.get("sl")
     tp = data.get("tp")
 
@@ -173,16 +169,15 @@ def webhook():
         }), 400
 
     try:
+        price = float(price)
         sl = float(sl)
         tp = float(tp)
-        price = float(price)
     except ValueError:
         return jsonify({
             "status": "error",
             "message": "Invalid numeric value in price/sl/tp"
         }), 400
 
-    # score is RSI in this Pine script
     if score < MIN_SCORE:
         print(f"Skipped: score {score} < MIN_SCORE {MIN_SCORE}")
         return jsonify({
@@ -192,13 +187,15 @@ def webhook():
 
     print(
         f"Parsed signal -> action={action}, symbol={symbol}, "
-        f"price={price}, score={score}, sl={sl}, tp={tp}, time={time_value}"
+        f"price={price}, score={score}, signal={signal}, "
+        f"sl={sl}, tp={tp}, time={time_value}"
     )
 
     status, response = place_order(symbol, action, sl, tp)
 
     return jsonify({
         "status": status,
+        "signal": signal,
         "response": response
     }), 200
 
