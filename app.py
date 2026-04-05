@@ -158,7 +158,10 @@ def webhook():
 
     if not data:
         print("No JSON received")
-        return jsonify({"status": "error", "message": "No JSON received"}), 400
+        return jsonify({
+            "status": "error",
+            "message": "No JSON received"
+        }), 400
 
     print("Webhook received:", data)
 
@@ -169,13 +172,14 @@ def webhook():
     time_value = data.get("time")
     signal = str(data.get("signal", "")).strip()
 
-    # heartbeat / scan mode
     if action == "scan":
         print(
             f"SCAN OK -> symbol={symbol}, timeframe={timeframe}, price={price}, "
-            f"signal={signal}, insideBar={data.get('insideBar')}, twoUp={data.get('twoUp')}, "
-            f"twoDown={data.get('twoDown')}, outsideBar={data.get('outsideBar')}, "
-            f"sessionOK={data.get('sessionOK')}, positionSize={data.get('positionSize')}, time={time_value}"
+            f"signal={signal}, htfBullBias={data.get('htfBullBias')}, "
+            f"htfBearBias={data.get('htfBearBias')}, inHTFDiscount={data.get('inHTFDiscount')}, "
+            f"inHTFPremium={data.get('inHTFPremium')}, sellSideSweep={data.get('sellSideSweep')}, "
+            f"buySideSweep={data.get('buySideSweep')}, bullBOS={data.get('bullBOS')}, "
+            f"bearBOS={data.get('bearBOS')}, sessionOK={data.get('sessionOK')}, time={time_value}"
         )
         return jsonify({
             "status": "scan_logged",
