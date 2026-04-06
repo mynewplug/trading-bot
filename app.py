@@ -1,236 +1,328 @@
 import os
 import json
 import logging
-from typing import Optional, Literal, Dict, Any
+from datetime import datetime, timezone
+from typing import Optional, Literal, Dict, Any, Set
 
-from fastapi import FastAPI, Header, HTTPException, Request
-from pydantic import BaseModel, Field
-import uvicorn
+from fastapi import FastAPI, Request, HTTPException
+from fastapi.responses import JSONResponse
+from pydantic import BaseModel, Field, ValidationError
 
-# ==========================================
+
+# =========================================================
 # LOGGING
-# ==========================================
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger("tv-webhook-bot")
+# =========================================================
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s | %(levelname)s | %(message)s"
+)
+logger = logging.getLogger("icc-webhook")
 
-# ==========================================
-# ENV
-# ==========================================
-WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "changeme")
-PORT = int(os.getenv("PORT", "10000"))
-BROKER_NAME = os.getenv("BROKER_NAME", "paper")
-DEFAULT_QTY = int(os.getenv("DEFAULT_QTY", "1"))
-ALLOW_LONGS = os.getenv("ALLOW_LONGS", "true").lower() == "true"
-ALLOW_SHORTS = os.getenv("ALLOW_SHORTS", "true").lower() == "true"
 
-# Tradovate / generic placeholders
-TRADOVATE_USERNAME = os.getenv("TRADOVATE_USERNAME", "")
-TRADOVATE_PASSWORD = os.getenv("TRADOVATE_PASSWORD", "")
-TRADOVATE_CID = os.getenv("TRADOVATE_CID", "")
-TRADOVATE_SECRET = os.getenv("TRADOVATE_SECRET", "")
-TRADOVATE_ACCOUNT_ID = os.getenv("TRADOVATE_ACCOUNT_ID", "")
-TRADOVATE_CONTRACT_ID = os.getenv("TRADOVATE_CONTRACT_ID", "")
-
-# ==========================================
+# =========================================================
 # APP
-# ==========================================
-app = FastAPI(title="TradingView Webhook Bot", version="2.0.0")
+# =========================================================
+app = FastAPI(title="ICC TradingView Webhook Bot")
 
-# ==========================================
-# DATA MODELS
-# ==========================================
-class TVSignal(BaseModel):
-    symbol: str
-    action: Literal[
-        "IMPULSE_BUY",
-        "IMPULSE_SELL",
-        "REVERSAL_BUY",
-        "REVERSAL_SELL",
-        "NO_TRADE"
-    ]
-    side: Literal["BUY", "SELL", "NONE"]
+
+# =========================================================
+# ENV / CONFIG
+# =========================================================
+WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "").strip()
+ENABLE_LIVE_TRADING = os.getenv("ENABLE_LIVE_TRADING", "false").lower() == "true"
+ALLOW_FORMING_SIGNALS = os.getenv("ALLOW_FORMING_SIGNALS", "false").lower() == "true"
+MAX_RISK_PER_TRADE = float(os.getenv("MAX_RISK_PER_TRADE", "0.0"))  # optional
+PORT = int(os.getenv("PORT", "8000"))
+
+# Optional broker env vars for future use
+BROKER_NAME = os.getenv("BROKER_NAME", "").strip()   # e.g. OANDA
+BROKER_API_KEY = os.getenv("BROKER_API_KEY", "").strip()
+BROKER_ACCOUNT_ID = os.getenv("BROKER_ACCOUNT_ID", "").strip()
+BROKER_ENV = os.getenv("BROKER_ENV", "practice").strip()
+
+
+# =========================================================
+# MEMORY / SIMPLE DUPLICATE PROTECTION
+# =========================================================
+processed_keys: Set[str] = set()
+
+
+# =========================================================
+# MODELS
+# =========================================================
+AllowedAction = Literal[
+    "ICC_BUY",
+    "ICC_SELL",
+    "ICC_BUY_FORMING",
+    "ICC_SELL_FORMING",
+    "NO_TRADE"
+]
+
+AllowedSide = Literal["BUY", "SELL", "NONE"]
+
+
+class WebhookPayload(BaseModel):
+    symbol: str = Field(..., min_length=1)
+    action: AllowedAction
+    side: AllowedSide
     price: float
     entry: float
-    stop_loss: float = Field(alias="stop_loss")
-    take_profit: float = Field(alias="take_profit")
+    stop_loss: float
+    take_profit: float
     timeframe: str
     timestamp: str
+    secret: Optional[str] = None
 
-class OrderResult(BaseModel):
-    ok: bool
-    broker: str
-    detail: Dict[str, Any]
+    def dedupe_key(self) -> str:
+        return f"{self.symbol}|{self.timeframe}|{self.timestamp}|{self.action}"
 
-# ==========================================
-# HEALTH
-# ==========================================
+
+# =========================================================
+# HELPERS
+# =========================================================
+def utc_now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+def safe_float(value: Any) -> float:
+    try:
+        return float(value)
+    except Exception as exc:
+        raise ValueError(f"Could not convert to float: {value}") from exc
+
+
+def validate_trade_levels(payload: WebhookPayload) -> None:
+    """
+    Validate only real trade signals.
+    NO_TRADE and FORMING signals do not require full trade validation.
+    """
+    if payload.action == "NO_TRADE":
+        return
+
+    if payload.action in {"ICC_BUY_FORMING", "ICC_SELL_FORMING"}:
+        return
+
+    if payload.side == "BUY":
+        if not (payload.stop_loss < payload.entry < payload.take_profit):
+            raise ValueError(
+                f"Invalid BUY levels. Expected stop_loss < entry < take_profit, "
+                f"got stop_loss={payload.stop_loss}, entry={payload.entry}, take_profit={payload.take_profit}"
+            )
+
+    elif payload.side == "SELL":
+        if not (payload.take_profit < payload.entry < payload.stop_loss):
+            raise ValueError(
+                f"Invalid SELL levels. Expected take_profit < entry < stop_loss, "
+                f"got take_profit={payload.take_profit}, entry={payload.entry}, stop_loss={payload.stop_loss}"
+            )
+
+
+def should_trade(payload: WebhookPayload) -> bool:
+    if payload.action in {"ICC_BUY", "ICC_SELL"}:
+        return True
+
+    if payload.action in {"ICC_BUY_FORMING", "ICC_SELL_FORMING"}:
+        return ALLOW_FORMING_SIGNALS
+
+    return False
+
+
+def log_payload(payload: WebhookPayload) -> None:
+    logger.info(
+        "Webhook received | symbol=%s action=%s side=%s timeframe=%s entry=%s sl=%s tp=%s ts=%s",
+        payload.symbol,
+        payload.action,
+        payload.side,
+        payload.timeframe,
+        payload.entry,
+        payload.stop_loss,
+        payload.take_profit,
+        payload.timestamp,
+    )
+
+
+# =========================================================
+# BROKER EXECUTION PLACEHOLDER
+# =========================================================
+def place_trade_with_broker(payload: WebhookPayload) -> Dict[str, Any]:
+    """
+    Replace this function with your actual broker logic.
+    Right now it only returns a simulated success response.
+
+    If you later want OANDA, Tradovate, etc., I’ll rewrite this whole block.
+    """
+    if not ENABLE_LIVE_TRADING:
+        logger.info("LIVE TRADING DISABLED | Simulating trade only.")
+        return {
+            "status": "simulated",
+            "broker": BROKER_NAME or "none",
+            "symbol": payload.symbol,
+            "action": payload.action,
+            "side": payload.side,
+            "entry": payload.entry,
+            "stop_loss": payload.stop_loss,
+            "take_profit": payload.take_profit,
+            "timestamp": utc_now_iso(),
+        }
+
+    # -------------------------------
+    # PUT YOUR LIVE BROKER CODE HERE
+    # -------------------------------
+    #
+    # Example structure:
+    # if BROKER_NAME == "OANDA":
+    #     return place_oanda_trade(payload)
+    #
+    # elif BROKER_NAME == "TRADOVATE":
+    #     return place_tradovate_trade(payload)
+    #
+    # else:
+    #     raise RuntimeError("Unsupported broker")
+    #
+    # For now, we simulate:
+    logger.info("LIVE TRADING ENABLED but broker function not yet implemented.")
+    return {
+        "status": "live_placeholder",
+        "broker": BROKER_NAME or "unknown",
+        "symbol": payload.symbol,
+        "action": payload.action,
+        "side": payload.side,
+        "entry": payload.entry,
+        "stop_loss": payload.stop_loss,
+        "take_profit": payload.take_profit,
+        "timestamp": utc_now_iso(),
+    }
+
+
+# =========================================================
+# ROUTES
+# =========================================================
 @app.get("/")
-def root():
+async def root() -> Dict[str, Any]:
     return {
         "ok": True,
-        "service": "TradingView Webhook Bot",
-        "broker": BROKER_NAME
+        "service": "icc-webhook-bot",
+        "live_trading": ENABLE_LIVE_TRADING,
+        "broker": BROKER_NAME or "none",
+        "time": utc_now_iso(),
     }
+
 
 @app.get("/health")
-def health():
-    return {"ok": True}
-
-# ==========================================
-# HELPERS
-# ==========================================
-def verify_secret(x_webhook_secret: Optional[str]) -> None:
-    if x_webhook_secret != WEBHOOK_SECRET:
-        raise HTTPException(status_code=401, detail="Invalid webhook secret")
-
-def side_allowed(side: str) -> bool:
-    if side == "BUY" and not ALLOW_LONGS:
-        return False
-    if side == "SELL" and not ALLOW_SHORTS:
-        return False
-    return True
-
-def normalize_qty(symbol: str, side: str) -> int:
-    return DEFAULT_QTY
-
-def build_order_payload(signal: TVSignal) -> Dict[str, Any]:
-    qty = normalize_qty(signal.symbol, signal.side)
+async def health() -> Dict[str, Any]:
     return {
-        "symbol": signal.symbol,
-        "side": signal.side,
-        "qty": qty,
-        "entry": signal.entry,
-        "stop_loss": signal.stop_loss,
-        "take_profit": signal.take_profit,
-        "signal_action": signal.action,
-        "timeframe": signal.timeframe,
-        "tv_timestamp": signal.timestamp
+        "status": "healthy",
+        "time": utc_now_iso(),
+        "live_trading": ENABLE_LIVE_TRADING,
+        "broker": BROKER_NAME or "none",
     }
 
-# ==========================================
-# NO TRADE HEARTBEAT HANDLER
-# ==========================================
-def handle_no_trade(signal: TVSignal) -> OrderResult:
-    detail = {
-        "message": "Heartbeat received: no trade this bar",
-        "symbol": signal.symbol,
-        "action": signal.action,
-        "timeframe": signal.timeframe,
-        "price": signal.price,
-        "timestamp": signal.timestamp
-    }
-    logger.info("NO_TRADE HEARTBEAT: %s", json.dumps(detail))
-    return OrderResult(
-        ok=True,
-        broker=BROKER_NAME,
-        detail=detail
-    )
 
-# ==========================================
-# PAPER BROKER
-# ==========================================
-def place_paper_order(signal: TVSignal) -> OrderResult:
-    order = build_order_payload(signal)
-    logger.info("PAPER ORDER: %s", json.dumps(order))
-    return OrderResult(
-        ok=True,
-        broker="paper",
-        detail={
-            "message": "Paper order accepted",
-            "order": order
-        }
-    )
-
-# ==========================================
-# TRADOVATE ADAPTER PLACEHOLDER
-# Replace this section with your real API code
-# ==========================================
-def place_tradovate_order(signal: TVSignal) -> OrderResult:
-    if not TRADOVATE_ACCOUNT_ID:
-        return OrderResult(
-            ok=False,
-            broker="tradovate",
-            detail={"message": "Missing TRADOVATE_ACCOUNT_ID env var"}
-        )
-
-    order = build_order_payload(signal)
-
-    logger.info("TRADOVATE ORDER REQUEST: %s", json.dumps(order))
-
-    simulated_response = {
-        "message": "Tradovate adapter scaffold reached",
-        "account_id": TRADOVATE_ACCOUNT_ID,
-        "contract_id": TRADOVATE_CONTRACT_ID,
-        "order": order
-    }
-
-    return OrderResult(
-        ok=True,
-        broker="tradovate",
-        detail=simulated_response
-    )
-
-# ==========================================
-# EXECUTOR
-# ==========================================
-def execute_trade(signal: TVSignal) -> OrderResult:
-    if signal.action == "NO_TRADE" or signal.side == "NONE":
-        return handle_no_trade(signal)
-
-    if not side_allowed(signal.side):
-        return OrderResult(
-            ok=False,
-            broker=BROKER_NAME,
-            detail={"message": f"{signal.side} trades are disabled"}
-        )
-
-    if BROKER_NAME == "paper":
-        return place_paper_order(signal)
-
-    if BROKER_NAME == "tradovate":
-        return place_tradovate_order(signal)
-
-    return OrderResult(
-        ok=False,
-        broker=BROKER_NAME,
-        detail={"message": f"Unsupported broker: {BROKER_NAME}"}
-    )
-
-# ==========================================
-# WEBHOOK
-# ==========================================
 @app.post("/webhook")
-async def webhook(
-    request: Request,
-    x_webhook_secret: Optional[str] = Header(default=None)
-):
-    verify_secret(x_webhook_secret)
+async def webhook(request: Request) -> JSONResponse:
+    raw_body = await request.body()
 
     try:
-        raw = await request.json()
-    except Exception as exc:
-        logger.exception("Invalid JSON")
-        raise HTTPException(status_code=400, detail=f"Invalid JSON: {exc}")
+        incoming = json.loads(raw_body.decode("utf-8"))
+    except json.JSONDecodeError:
+        logger.error("Invalid JSON received: %s", raw_body)
+        raise HTTPException(status_code=400, detail="Invalid JSON")
 
     try:
-        signal = TVSignal(**raw)
-    except Exception as exc:
-        logger.exception("Payload validation failed")
-        raise HTTPException(status_code=422, detail=f"Payload validation failed: {exc}")
+        payload = WebhookPayload(**incoming)
+    except ValidationError as exc:
+        logger.error("Payload validation error: %s | payload=%s", exc, incoming)
+        raise HTTPException(status_code=400, detail=exc.errors())
 
-    logger.info("SIGNAL RECEIVED: %s", signal.model_dump_json())
+    # Optional secret check
+    if WEBHOOK_SECRET:
+        if payload.secret != WEBHOOK_SECRET:
+            logger.warning("Unauthorized webhook attempt for symbol=%s", payload.symbol)
+            raise HTTPException(status_code=401, detail="Invalid secret")
 
-    result = execute_trade(signal)
+    # Duplicate bar/action protection
+    dedupe_key = payload.dedupe_key()
+    if dedupe_key in processed_keys:
+        logger.info("Duplicate webhook ignored | %s", dedupe_key)
+        return JSONResponse(
+            status_code=200,
+            content={
+                "ok": True,
+                "status": "duplicate_ignored",
+                "action": payload.action,
+                "symbol": payload.symbol,
+                "timestamp": payload.timestamp,
+            },
+        )
 
-    if not result.ok:
-        logger.warning("REQUEST REJECTED: %s", result.model_dump_json())
-        raise HTTPException(status_code=400, detail=result.detail)
+    log_payload(payload)
 
-    logger.info("REQUEST ACCEPTED: %s", result.model_dump_json())
-    return result.model_dump()
+    # Validate only when needed
+    try:
+        validate_trade_levels(payload)
+    except ValueError as exc:
+        logger.error("Trade level validation failed: %s", exc)
+        raise HTTPException(status_code=400, detail=str(exc))
 
-# ==========================================
-# MAIN
-# ==========================================
-if __name__ == "__main__":
-    uvicorn.run("main:app", host="0.0.0.0", port=PORT, reload=False)
+    # Handle NO_TRADE heartbeat safely
+    if payload.action == "NO_TRADE":
+        processed_keys.add(dedupe_key)
+        logger.info("Heartbeat accepted | symbol=%s timeframe=%s", payload.symbol, payload.timeframe)
+        return JSONResponse(
+            status_code=200,
+            content={
+                "ok": True,
+                "status": "heartbeat_accepted",
+                "action": payload.action,
+                "symbol": payload.symbol,
+                "side": payload.side,
+                "timestamp": payload.timestamp,
+            },
+        )
+
+    # Handle forming signals safely
+    if payload.action in {"ICC_BUY_FORMING", "ICC_SELL_FORMING"} and not ALLOW_FORMING_SIGNALS:
+        processed_keys.add(dedupe_key)
+        logger.info("Forming signal accepted but not traded | action=%s", payload.action)
+        return JSONResponse(
+            status_code=200,
+            content={
+                "ok": True,
+                "status": "forming_signal_logged",
+                "action": payload.action,
+                "symbol": payload.symbol,
+                "side": payload.side,
+                "timestamp": payload.timestamp,
+            },
+        )
+
+    # Real trade signal
+    if should_trade(payload):
+        broker_result = place_trade_with_broker(payload)
+        processed_keys.add(dedupe_key)
+
+        logger.info("Trade processed | result=%s", broker_result)
+
+        return JSONResponse(
+            status_code=200,
+            content={
+                "ok": True,
+                "status": "trade_processed",
+                "action": payload.action,
+                "symbol": payload.symbol,
+                "side": payload.side,
+                "broker_result": broker_result,
+            },
+        )
+
+    processed_keys.add(dedupe_key)
+    return JSONResponse(
+        status_code=200,
+        content={
+            "ok": True,
+            "status": "accepted_no_execution",
+            "action": payload.action,
+            "symbol": payload.symbol,
+            "side": payload.side,
+        },
+    )
