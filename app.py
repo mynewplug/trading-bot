@@ -1,230 +1,236 @@
 import os
-from flask import Flask, request, jsonify
-import requests
+import json
+import logging
+from typing import Optional, Literal, Dict, Any
 
-app = Flask(__name__)
+from fastapi import FastAPI, Header, HTTPException, Request
+from pydantic import BaseModel, Field
+import uvicorn
 
-# ====================
-# OANDA CONFIG
-# ====================
-OANDA_API_KEY = os.getenv("OANDA_API_KEY")
-OANDA_ACCOUNT_ID = os.getenv("OANDA_ACCOUNT_ID")
-OANDA_ENV = os.getenv("OANDA_ENV", "practice").lower()
+# ==========================================
+# LOGGING
+# ==========================================
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger("tv-webhook-bot")
 
-BASE_URL = (
-    "https://api-fxpractice.oanda.com"
-    if OANDA_ENV == "practice"
-    else "https://api-fxtrade.oanda.com"
-)
+# ==========================================
+# ENV
+# ==========================================
+WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "changeme")
+PORT = int(os.getenv("PORT", "10000"))
+BROKER_NAME = os.getenv("BROKER_NAME", "paper")
+DEFAULT_QTY = int(os.getenv("DEFAULT_QTY", "1"))
+ALLOW_LONGS = os.getenv("ALLOW_LONGS", "true").lower() == "true"
+ALLOW_SHORTS = os.getenv("ALLOW_SHORTS", "true").lower() == "true"
 
-HEADERS = {
-    "Authorization": f"Bearer {OANDA_API_KEY}",
-    "Content-Type": "application/json"
-}
+# Tradovate / generic placeholders
+TRADOVATE_USERNAME = os.getenv("TRADOVATE_USERNAME", "")
+TRADOVATE_PASSWORD = os.getenv("TRADOVATE_PASSWORD", "")
+TRADOVATE_CID = os.getenv("TRADOVATE_CID", "")
+TRADOVATE_SECRET = os.getenv("TRADOVATE_SECRET", "")
+TRADOVATE_ACCOUNT_ID = os.getenv("TRADOVATE_ACCOUNT_ID", "")
+TRADOVATE_CONTRACT_ID = os.getenv("TRADOVATE_CONTRACT_ID", "")
 
-# ====================
-# SETTINGS
-# ====================
-BASE_UNITS = int(os.getenv("BASE_UNITS", "1000"))
-MIN_PRICE_BUFFER = float(os.getenv("MIN_PRICE_BUFFER", "0.00005"))
+# ==========================================
+# APP
+# ==========================================
+app = FastAPI(title="TradingView Webhook Bot", version="2.0.0")
 
-# ====================
-# SYMBOL / PRECISION
-# ====================
-SYMBOL_MAP = {
-    "EURUSD": "EUR_USD",
-    "GBPUSD": "GBP_USD",
-    "USDJPY": "USD_JPY",
-    "AUDUSD": "AUD_USD",
-    "USDCAD": "USD_CAD",
-    "USDCHF": "USD_CHF",
-    "NZDUSD": "NZD_USD",
-    "XAUUSD": "XAU_USD",
-    "XAGUSD": "XAG_USD",
-}
+# ==========================================
+# DATA MODELS
+# ==========================================
+class TVSignal(BaseModel):
+    symbol: str
+    action: Literal[
+        "IMPULSE_BUY",
+        "IMPULSE_SELL",
+        "REVERSAL_BUY",
+        "REVERSAL_SELL",
+        "NO_TRADE"
+    ]
+    side: Literal["BUY", "SELL", "NONE"]
+    price: float
+    entry: float
+    stop_loss: float = Field(alias="stop_loss")
+    take_profit: float = Field(alias="take_profit")
+    timeframe: str
+    timestamp: str
 
-INSTRUMENT_PRECISION = {
-    "EUR_USD": 5,
-    "GBP_USD": 5,
-    "AUD_USD": 5,
-    "NZD_USD": 5,
-    "USD_CAD": 5,
-    "USD_CHF": 5,
-    "USD_JPY": 3,
-    "XAU_USD": 2,
-    "XAG_USD": 3,
-}
+class OrderResult(BaseModel):
+    ok: bool
+    broker: str
+    detail: Dict[str, Any]
 
-
-def get_oanda_instrument(tv_symbol: str) -> str:
-    clean = str(tv_symbol).replace("OANDA:", "").replace("/", "").upper().strip()
-    return SYMBOL_MAP.get(clean, clean)
-
-
-def format_price(instrument: str, price: float) -> str:
-    decimals = INSTRUMENT_PRECISION.get(instrument, 5)
-    return f"{float(price):.{decimals}f}"
-
-
-def has_open_trade() -> bool:
-    url = f"{BASE_URL}/v3/accounts/{OANDA_ACCOUNT_ID}/openTrades"
-    r = requests.get(url, headers=HEADERS, timeout=15)
-
-    if r.status_code != 200:
-        print("Error checking open trades:", r.status_code, r.text)
-        return False
-
-    trades = r.json().get("trades", [])
-    print("Open trades count:", len(trades))
-    return len(trades) > 0
-
-
-def validate_levels(action: str, price: float, sl: float, tp: float):
-    buffer_amt = MIN_PRICE_BUFFER
-
-    if action == "buy":
-        if sl >= price:
-            sl = price - buffer_amt
-        if tp <= price:
-            tp = price + buffer_amt
-        if (price - sl) < buffer_amt:
-            sl = price - buffer_amt
-        if (tp - price) < buffer_amt:
-            tp = price + buffer_amt
-
-    elif action == "sell":
-        if sl <= price:
-            sl = price + buffer_amt
-        if tp >= price:
-            tp = price - buffer_amt
-        if (sl - price) < buffer_amt:
-            sl = price + buffer_amt
-        if (price - tp) < buffer_amt:
-            tp = price - buffer_amt
-
-    return sl, tp
-
-
-def place_order(symbol: str, action: str, price: float, sl: float, tp: float):
-    instrument = get_oanda_instrument(symbol)
-
-    if has_open_trade():
-        print("Skipped: open trade already exists")
-        return 200, "Skipped: open trade exists"
-
-    if action == "buy":
-        units = BASE_UNITS
-    elif action == "sell":
-        units = -BASE_UNITS
-    else:
-        return 400, f"Invalid action: {action}"
-
-    sl, tp = validate_levels(action, price, sl, tp)
-
-    sl_price = format_price(instrument, sl)
-    tp_price = format_price(instrument, tp)
-
-    payload = {
-        "order": {
-            "instrument": instrument,
-            "units": str(units),
-            "type": "MARKET",
-            "timeInForce": "FOK",
-            "positionFill": "DEFAULT",
-            "stopLossOnFill": {"price": sl_price},
-            "takeProfitOnFill": {"price": tp_price}
-        }
+# ==========================================
+# HEALTH
+# ==========================================
+@app.get("/")
+def root():
+    return {
+        "ok": True,
+        "service": "TradingView Webhook Bot",
+        "broker": BROKER_NAME
     }
 
-    print("Sending order payload:", payload)
+@app.get("/health")
+def health():
+    return {"ok": True}
 
-    url = f"{BASE_URL}/v3/accounts/{OANDA_ACCOUNT_ID}/orders"
-    r = requests.post(url, headers=HEADERS, json=payload, timeout=20)
+# ==========================================
+# HELPERS
+# ==========================================
+def verify_secret(x_webhook_secret: Optional[str]) -> None:
+    if x_webhook_secret != WEBHOOK_SECRET:
+        raise HTTPException(status_code=401, detail="Invalid webhook secret")
 
-    print("OANDA status:", r.status_code)
-    print("OANDA response:", r.text)
+def side_allowed(side: str) -> bool:
+    if side == "BUY" and not ALLOW_LONGS:
+        return False
+    if side == "SELL" and not ALLOW_SHORTS:
+        return False
+    return True
 
-    return r.status_code, r.text
+def normalize_qty(symbol: str, side: str) -> int:
+    return DEFAULT_QTY
 
+def build_order_payload(signal: TVSignal) -> Dict[str, Any]:
+    qty = normalize_qty(signal.symbol, signal.side)
+    return {
+        "symbol": signal.symbol,
+        "side": signal.side,
+        "qty": qty,
+        "entry": signal.entry,
+        "stop_loss": signal.stop_loss,
+        "take_profit": signal.take_profit,
+        "signal_action": signal.action,
+        "timeframe": signal.timeframe,
+        "tv_timestamp": signal.timestamp
+    }
 
-@app.route("/", methods=["GET"])
-def home():
-    return "Bot is running 🚀", 200
-
-
-@app.route("/webhook", methods=["POST"])
-def webhook():
-    data = request.get_json(force=True, silent=True)
-
-    if not data:
-        print("No JSON received")
-        return jsonify({
-            "status": "error",
-            "message": "No JSON received"
-        }), 400
-
-    print("Webhook received:", data)
-
-    action = str(data.get("action", "")).lower().strip()
-    symbol = str(data.get("symbol", "")).upper().strip()
-    timeframe = str(data.get("timeframe", "")).strip()
-    price = data.get("price")
-    time_value = data.get("time")
-    signal = str(data.get("signal", "")).strip()
-
-    if action == "scan":
-        print(
-            f"SCAN OK -> symbol={symbol}, timeframe={timeframe}, price={price}, "
-            f"signal={signal}, htfBullBias={data.get('htfBullBias')}, "
-            f"htfBearBias={data.get('htfBearBias')}, inHTFDiscount={data.get('inHTFDiscount')}, "
-            f"inHTFPremium={data.get('inHTFPremium')}, sellSideSweep={data.get('sellSideSweep')}, "
-            f"buySideSweep={data.get('buySideSweep')}, bullBOS={data.get('bullBOS')}, "
-            f"bearBOS={data.get('bearBOS')}, sessionOK={data.get('sessionOK')}, time={time_value}"
-        )
-        return jsonify({
-            "status": "scan_logged",
-            "signal": signal
-        }), 200
-
-    sl = data.get("sl")
-    tp = data.get("tp")
-
-    if not action or not symbol or price is None or sl is None or tp is None:
-        return jsonify({
-            "status": "error",
-            "message": "Missing action, symbol, price, sl, or tp"
-        }), 400
-
-    if action not in ["buy", "sell"]:
-        return jsonify({
-            "status": "error",
-            "message": f"Invalid action: {action}"
-        }), 400
-
-    try:
-        price = float(price)
-        sl = float(sl)
-        tp = float(tp)
-    except ValueError:
-        return jsonify({
-            "status": "error",
-            "message": "Invalid numeric value in price/sl/tp"
-        }), 400
-
-    print(
-        f"Parsed signal -> action={action}, symbol={symbol}, timeframe={timeframe}, "
-        f"price={price}, signal={signal}, sl={sl}, tp={tp}, time={time_value}"
+# ==========================================
+# NO TRADE HEARTBEAT HANDLER
+# ==========================================
+def handle_no_trade(signal: TVSignal) -> OrderResult:
+    detail = {
+        "message": "Heartbeat received: no trade this bar",
+        "symbol": signal.symbol,
+        "action": signal.action,
+        "timeframe": signal.timeframe,
+        "price": signal.price,
+        "timestamp": signal.timestamp
+    }
+    logger.info("NO_TRADE HEARTBEAT: %s", json.dumps(detail))
+    return OrderResult(
+        ok=True,
+        broker=BROKER_NAME,
+        detail=detail
     )
 
-    status, response = place_order(symbol, action, price, sl, tp)
+# ==========================================
+# PAPER BROKER
+# ==========================================
+def place_paper_order(signal: TVSignal) -> OrderResult:
+    order = build_order_payload(signal)
+    logger.info("PAPER ORDER: %s", json.dumps(order))
+    return OrderResult(
+        ok=True,
+        broker="paper",
+        detail={
+            "message": "Paper order accepted",
+            "order": order
+        }
+    )
 
-    return jsonify({
-        "status": status,
-        "signal": signal,
-        "response": response
-    }), 200
+# ==========================================
+# TRADOVATE ADAPTER PLACEHOLDER
+# Replace this section with your real API code
+# ==========================================
+def place_tradovate_order(signal: TVSignal) -> OrderResult:
+    if not TRADOVATE_ACCOUNT_ID:
+        return OrderResult(
+            ok=False,
+            broker="tradovate",
+            detail={"message": "Missing TRADOVATE_ACCOUNT_ID env var"}
+        )
 
+    order = build_order_payload(signal)
 
+    logger.info("TRADOVATE ORDER REQUEST: %s", json.dumps(order))
+
+    simulated_response = {
+        "message": "Tradovate adapter scaffold reached",
+        "account_id": TRADOVATE_ACCOUNT_ID,
+        "contract_id": TRADOVATE_CONTRACT_ID,
+        "order": order
+    }
+
+    return OrderResult(
+        ok=True,
+        broker="tradovate",
+        detail=simulated_response
+    )
+
+# ==========================================
+# EXECUTOR
+# ==========================================
+def execute_trade(signal: TVSignal) -> OrderResult:
+    if signal.action == "NO_TRADE" or signal.side == "NONE":
+        return handle_no_trade(signal)
+
+    if not side_allowed(signal.side):
+        return OrderResult(
+            ok=False,
+            broker=BROKER_NAME,
+            detail={"message": f"{signal.side} trades are disabled"}
+        )
+
+    if BROKER_NAME == "paper":
+        return place_paper_order(signal)
+
+    if BROKER_NAME == "tradovate":
+        return place_tradovate_order(signal)
+
+    return OrderResult(
+        ok=False,
+        broker=BROKER_NAME,
+        detail={"message": f"Unsupported broker: {BROKER_NAME}"}
+    )
+
+# ==========================================
+# WEBHOOK
+# ==========================================
+@app.post("/webhook")
+async def webhook(
+    request: Request,
+    x_webhook_secret: Optional[str] = Header(default=None)
+):
+    verify_secret(x_webhook_secret)
+
+    try:
+        raw = await request.json()
+    except Exception as exc:
+        logger.exception("Invalid JSON")
+        raise HTTPException(status_code=400, detail=f"Invalid JSON: {exc}")
+
+    try:
+        signal = TVSignal(**raw)
+    except Exception as exc:
+        logger.exception("Payload validation failed")
+        raise HTTPException(status_code=422, detail=f"Payload validation failed: {exc}")
+
+    logger.info("SIGNAL RECEIVED: %s", signal.model_dump_json())
+
+    result = execute_trade(signal)
+
+    if not result.ok:
+        logger.warning("REQUEST REJECTED: %s", result.model_dump_json())
+        raise HTTPException(status_code=400, detail=result.detail)
+
+    logger.info("REQUEST ACCEPTED: %s", result.model_dump_json())
+    return result.model_dump()
+
+# ==========================================
+# MAIN
+# ==========================================
 if __name__ == "__main__":
-    port = int(os.getenv("PORT", "8000"))
-    app.run(host="0.0.0.0", port=port)
+    uvicorn.run("main:app", host="0.0.0.0", port=PORT, reload=False)
